@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+
+if [ ! -d "$1" -o $(find "$1" | wc -l) -gt 0 ]; then
+  echo "first argument ($1) must be an existing (empty) directory"
+  exit 1
+fi
+
+if ! git remote get-url "$2" &> /dev/null; then
+  echo "Second argument ($2) must be an existing remote (do a git remote add <name> <git spec of external component> first"
+  exit 1
+fi
+
+git fetch "$2"
+
+if ! git rev-parse "$2"/"$3" &> /dev/null; then
+  echo "remote branch does not exist"
+  exit 1
+fi 
+
+if ! git branch --track "${2}-${3}" "$2/$3" &> /dev/null; then
+  echo could not create a tracking branch "${2}-${3}"
+  exit 1
+fi
+
+git merge -s ours --no-commit --allow-unrelated-histories "$2"/"$3"
+git read-tree --prefix="$1" -u "$2"/"$3"
+git commit -m "remote repository $2/$3 cloned into directory $1"
+mkdir -p external-git
+for tool in $(echo pull init); do
+  if [ -e external-git/$tool ]; then
+    echo '#!/bin/sh' > external-git/$tool
+    chmod +x external-git/$tool
+  fi
+done
+#FIXME: I think i need to add rebase to the pull command
+# I should test it with a repo added to a subtree that has a 
+# local commit and then receives a pull
+echo "git pull -s subtree '"$2/$3"'" >> external-git/pull
+echo "git remote add \"$2\" $(git remote get-url "$2")"  >> external-git/init

@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+
+remote=$1
+subdir=$2
+working=${3:-HEAD}
+
+# REMOTE should be the name of a remote branch
+if ! git rev-parse --verify -q $remote > /dev/null; then
+  echo "Usage: $0 <remote> <subdir> [branch-with-local-changes] [name-of-pushbranch] [name-of-checkpoint-branch]"
+  echo "remote: $remote is not an existing branch"
+  exit 1
+fi
+
+if [ ! -d "$subdir" ]; then
+  echo "Usage: $0 <remote> <subdir> [branch-with-local-changes] [name-of-pushbranch] [name-of-checkpoint-branch]"
+  echo 'subdir '$subdir' is not an existing directory'
+  exit 1
+fi
+
+if [ -z "$4" ]; then
+  if echo $remote | grep -q '/'; then
+     remotespec=${remote%/*}
+     remotebranch=${remote#*/}
+     push=${remotespec}-${remotebranch}
+  else
+     push=${remote}-push
+  fi
+fi
+checkpoint=${5:-${push}-checkpoint}
+
+echo -e "Using:\n  remote=$remote\n  subdir=$subdir\n  branch with local changes=$working\n  name of push branch=$push\n  name of checkpoint branch=$checkpoint"
+
+if [ -z "$(git merge-base $remote $working)" ]; then
+  echo "remote \($remote\) must have been merged into worktree \($working\) at some point"
+fi
+
+# $push may or may not exist. If it does, $checkpoint must also exist
+# $checkpoint must be an ancestor of $working
+if git rev-parse --verify -q $push > /dev/null; then
+  if ! git rev-parse --verify -q $checkpoint > /dev/null; then
+    echo "push branch \($push\) is an existing branch, therefore checkpoint branch \($checkpoint\) must also exist"
+    exit 1
+  else
+    if ! git merge-base --is-ancestor $checkpoint $working; then
+      echo "$checkpoint must be an ancestor of $working"
+      exit 1
+    else
+      echo "Continuing from $push and $checkpoint onwards"
+    fi
+  fi
+else
+  # if PUSH does not exist, CHECKPOINT and push will be the earliest merge from remote into working
+  while read -r merge; do
+    while read -r parent; do
+      if git merge-base --is-ancestor $parent $remote; then
+        oldestmerge=$merge
+        oldestsource=$parent
+        break
+      fi 
+    done < <(git rev-parse $merge^@)
+  done < <(git rev-list $working ^$remote --merges)
+  echo "$push and $checkpoint do not exist."
+  echo "  Initializing $checkpoint to $(git show --pretty=oneline --abbrev-commit --decorate --no-patch "$oldestmerge")"
+  echo "  Initializing $push to $(git show --pretty=oneline --abbrev-commit --decorate --no-patch "$oldestsource")"
+  git branch -f $checkpoint "$oldestmerge"
+  git branch -f $push "$oldestsource"
+fi
+
+pushstart=$(git rev-parse --short $push)
+
+echo ""
+
+# For each ancestor commit between WORKING and CHECKPOINT that changes the subdir
+for commit in $(git rev-list --reverse --ancestry-path $checkpoint..$working -- "$subdir"); do
+  # get the tree hash of the subdir
+  treehash=$(git rev-parse --verify -q "${commit}:$subdir")
+  if [ -z "$treehash" ]; then
+    # this commit for some reason does not contain the subdir
+    # creating a commit that has no contents would be silly, so let's just skip it
+    continue
+  fi
+  # get all parents that are also ancestors of $remote
+  parents="-p $push "
+  ismerge=
+  for parent in $(git show -s --format=%P $commit); do
+    if git merge-base --is-ancestor $parent $remote; then
+      echo "MERGE:  $(git show --pretty=oneline --abbrev-commit --decorate --no-patch $commit)"
+      ismerge="yes"
+      parents="$parents -p $parent"
+    fi
+  done
+  if [ -z "$ismerge" ]; then
+    echo "NORMAL: $(git show --pretty=oneline --abbrev-commit --decorate --no-patch $commit)"
+  fi
+  #create new commit that points to any commits in the remote branch and to the previous commit in the push branch with the same message as the current commit
+  let createdcommits=$createdcommits+1
+  rebased_commit=$(git commit-tree $treehash $parents -m "$(git show -s --format=%B $commit)")
+  #update push branch
+  git branch -f $push $rebased_commit
+  #move checkpoint
+  git branch -f $checkpoint $commit
+done
+
+echo ""
+
+if [ -z "$createdcommits" ]; then
+  echo "Done! No new commits where added to $push"
+else
+  echo -e "Done! $createdcommits commits were added. To fix commit messages or remove private code run:\n\ngit rebase -i --rebase-merges $pushstart $push"
+fi
